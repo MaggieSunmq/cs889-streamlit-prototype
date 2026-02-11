@@ -1,8 +1,7 @@
 import json
+import os
 import streamlit as st
 from google import genai
-import os
-
 
 # -----------------------------
 # Page config
@@ -14,7 +13,9 @@ st.set_page_config(page_title="Literature Search", layout="wide")
 # -----------------------------
 DATA_PATH = os.path.join(os.path.dirname(__file__), "example-bib.json")
 MODEL_NAME = "gemini-2.5-flash"
-client = genai.Client()  # picks up GEMINI_API_KEY from env
+
+HAS_GEMINI = bool(os.getenv("GEMINI_API_KEY"))
+client = genai.Client() if HAS_GEMINI else None
 
 
 # -----------------------------
@@ -142,6 +143,10 @@ div.stButton > button{
 .meta-v {
     opacity: 0.98;
 }
+.small-muted {
+    opacity: 0.7;
+    font-size: 0.9rem;
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -158,9 +163,6 @@ def toggle_save(pid, saved_ids):
 
 
 def render_metadata_pretty_no_columns(p, key_prefix=""):
-    """
-    IMPORTANT: No st.columns() here (avoids Streamlit column nesting error).
-    """
     pid = p.get("id")
     year = p.get("year")
     venue = p.get("journal", "") or p.get("venue", "")
@@ -204,10 +206,27 @@ def render_metadata_pretty_no_columns(p, key_prefix=""):
         st.json(p)
 
 
+def summarize_abstract_with_gemini(title: str, abstract: str) -> str:
+    prompt = f"""
+You summarize academic papers using ONLY the abstract.
+
+Title: {title}
+
+Abstract:
+{abstract}
+
+Return:
+- 1 sentence plain-English takeaway
+- 3 bullet points: method / data / results (if available)
+- 5 keywords
+
+Be faithful to the abstract; do not add facts not stated.
+"""
+    resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+    return (resp.text or "").strip()
+
+
 def render_paper_card(p, saved_ids, key_prefix=""):
-    """
-    No nested expanders. Tabs are OK.
-    """
     pid = p.get("id")
     title = p.get("title", "(no title)")
     year = p.get("year", "")
@@ -216,15 +235,16 @@ def render_paper_card(p, saved_ids, key_prefix=""):
     url = paper_url(p)
     doi = (p.get("doi") or "").strip()
     kw = norm_keywords(p)
+    abstract = (p.get("abstract") or "").strip()
 
     saved = pid in saved_ids
     star = "★" if saved else "☆"
-    #save_text = "Saved" if saved else "Save"
+    save_text = "Saved" if saved else "Save"
 
     cols = st.columns([0.12, 0.88], vertical_alignment="top")
     with cols[0]:
         btn_key = f"{key_prefix}save_{pid}_{hash(title)}"
-        if st.button(f"{star}", key=btn_key, use_container_width=True):
+        if st.button(f"{star} {save_text}", key=btn_key, use_container_width=True):
             toggle_save(pid, saved_ids)
             st.rerun()
 
@@ -244,16 +264,102 @@ def render_paper_card(p, saved_ids, key_prefix=""):
             more = f" … (+{len(kw)-12})" if len(kw) > 12 else ""
             st.caption("Tags: " + preview + more)
 
-        tab_meta, tab_abs = st.tabs(["Metadata", "Abstract"])
+        tab_meta, tab_abs, tab_sum = st.tabs(["Metadata", "Abstract", "Summary"])
         with tab_meta:
             render_metadata_pretty_no_columns(p, key_prefix=key_prefix)
+
         with tab_abs:
-            if p.get("abstract"):
-                st.write(p["abstract"])
+            if abstract:
+                st.write(abstract)
             else:
                 st.caption("No abstract.")
 
+        with tab_sum:
+            if not abstract:
+                st.caption("No abstract available, so there is nothing to summarize.")
+            elif not HAS_GEMINI:
+                st.warning("Gemini is not configured (missing GEMINI_API_KEY). Add it in Streamlit Cloud secrets.")
+            else:
+                if "summaries" not in st.session_state:
+                    st.session_state.summaries = {}
+                cache_key = str(pid) if pid is not None else f"{hash(title)}"
+
+                if cache_key in st.session_state.summaries:
+                    st.markdown(st.session_state.summaries[cache_key])
+                    if st.button("Regenerate summary", key=f"{key_prefix}regen_{cache_key}"):
+                        with st.spinner("Summarizing…"):
+                            s = summarize_abstract_with_gemini(title, abstract)
+                        st.session_state.summaries[cache_key] = s
+                        st.rerun()
+                else:
+                    st.markdown(
+                        '<div class="small-muted">Generate a summary from the abstract.</div>',
+                        unsafe_allow_html=True,
+                    )
+                    if st.button("Summarize with Gemini", type="primary", key=f"{key_prefix}sum_{cache_key}"):
+                        with st.spinner("Summarizing…"):
+                            s = summarize_abstract_with_gemini(title, abstract)
+                        st.session_state.summaries[cache_key] = s
+                        st.rerun()
+
+
     st.divider()
+
+
+def run_ai_retrieval(intent: str, top_k_ai: int, papers, papers_by_id):
+    library = [brief_for_ai(p) for p in papers]
+    prompt = f"""
+You are an AI retrieval tool over a local paper library.
+
+Return ONLY valid JSON with exactly this schema:
+{{
+  "paper_ids": ["... up to {top_k_ai} ids from the library ..."],
+  "note": "1-2 sentence rationale"
+}}
+
+User intent: {intent}
+
+Library (JSON list):
+{json.dumps(library, ensure_ascii=False)}
+"""
+    resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+    parsed = parse_json_lenient(resp.text or "") or {}
+    ids = parsed.get("paper_ids", [])
+    if not isinstance(ids, list):
+        ids = []
+    ids = [pid for pid in ids if pid in papers_by_id]
+    note = str(parsed.get("note", "")).strip()
+    return ids, note
+
+
+def chat_planner(user_msg: str, total_papers: int):
+    prompt = f"""
+You are a research assistant helping a user search papers in a LOCAL library (size: {total_papers}).
+
+Return ONLY valid JSON:
+{{
+  "assistant_message": "short helpful message (2-5 sentences)",
+  "keyword_query": "a compact keyword-style query for lexical matching",
+  "ai_intent": "a richer natural-language intent for AI retrieval",
+  "filters": {{
+    "only_with_doi": true/false,
+    "year_min": number or null,
+    "year_max": number or null
+  }}
+}}
+
+Rules:
+- Keep keyword_query short and specific (no long sentences).
+- ai_intent can be more descriptive.
+- If the user didn’t mention DOI/year constraints, set filters to null/false.
+- Do not mention web search. This is local-only.
+- Output JSON only.
+
+User message:
+{user_msg}
+"""
+    resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+    return parse_json_lenient(resp.text or "")
 
 
 # -----------------------------
@@ -274,26 +380,132 @@ if "kw_ran" not in st.session_state:
     st.session_state.kw_ran = False
 if "kw_results" not in st.session_state:
     st.session_state.kw_results = []
+if "ai_intent_override" not in st.session_state:
+    st.session_state.ai_intent_override = ""
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "chat_suggestions" not in st.session_state:
+    st.session_state.chat_suggestions = {
+        "assistant_message": "",
+        "keyword_query": "",
+        "ai_intent": "",
+        "filters": {"only_with_doi": False, "year_min": None, "year_max": None},
+    }
 
 
 # -----------------------------
-# Top bar
+# Header + Chat (optional)
 # -----------------------------
 st.markdown("## Literature Search")
 
+with st.expander("Chat assistant (optional) — refine your search goal", expanded=False):
+    if not HAS_GEMINI:
+        st.warning("Gemini is not configured (missing GEMINI_API_KEY). Add it in Streamlit Cloud secrets to use chat.")
+    else:
+        # --- Chat controls bar (NEW) ---
+        bar_left, bar_right = st.columns([0.7, 0.3], vertical_alignment="center")
+        with bar_left:
+            st.caption("Chat history is stored only for this session.")
+        with bar_right:
+            if st.button("Clear chat history", use_container_width=True):
+                st.session_state.chat_messages = []
+                st.session_state.chat_suggestions = {
+                    "assistant_message": "",
+                    "keyword_query": "",
+                    "ai_intent": "",
+                    "filters": {"only_with_doi": False, "year_min": None, "year_max": None},
+                }
+                st.rerun()
+
+        st.divider()
+
+        # Show chat history
+        for m in st.session_state.chat_messages:
+            with st.chat_message(m["role"]):
+                st.markdown(m["content"])
+
+        auto_run_ai_after_chat = st.checkbox("Auto-run AI retrieval after chat", value=False)
+
+        user_msg = st.chat_input("Describe what you want (topic, methods, constraints, etc.)")
+        if user_msg:
+            st.session_state.chat_messages.append({"role": "user", "content": user_msg})
+            with st.chat_message("user"):
+                st.markdown(user_msg)
+
+            with st.spinner("Thinking…"):
+                parsed = chat_planner(user_msg, total_papers=len(papers)) or {}
+
+            assistant_message = str(parsed.get("assistant_message", "")).strip()
+            keyword_query = str(parsed.get("keyword_query", "")).strip()
+            ai_intent = str(parsed.get("ai_intent", "")).strip()
+            filters = parsed.get("filters", {}) if isinstance(parsed.get("filters", {}), dict) else {}
+
+            # Store suggestions
+            st.session_state.chat_suggestions = {
+                "assistant_message": assistant_message,
+                "keyword_query": keyword_query,
+                "ai_intent": ai_intent,
+                "filters": {
+                    "only_with_doi": bool(filters.get("only_with_doi", False)),
+                    "year_min": filters.get("year_min", None),
+                    "year_max": filters.get("year_max", None),
+                },
+            }
+
+            st.session_state.chat_messages.append({"role": "assistant", "content": assistant_message or "(no message)"})
+            with st.chat_message("assistant"):
+                st.markdown(assistant_message or "(no message)")
+
+            if auto_run_ai_after_chat and ai_intent:
+                with st.spinner("Auto-running AI retrieval…"):
+                    ids, note = run_ai_retrieval(ai_intent, top_k_ai=20, papers=papers, papers_by_id=papers_by_id)
+                st.session_state.ai_selected_ids = ids
+                st.session_state.ai_note = note
+                st.session_state.ai_intent_override = ai_intent
+                st.rerun()
+
+        sugg = st.session_state.chat_suggestions
+        st.markdown("---")
+        st.markdown("**Suggested queries from chat**")
+        st.write(f"**Keyword query:** {sugg.get('keyword_query') or '—'}")
+        st.write(f"**AI intent:** {sugg.get('ai_intent') or '—'}")
+
+        # a1, a2, a3 = st.columns(3)
+        # with a1:
+        #     if st.button("Apply keyword query"):
+        #         if sugg.get("keyword_query"):
+        #             st.session_state.query = sugg["keyword_query"]
+        #             st.rerun()
+        # with a2:
+        #     if st.button("Apply AI intent"):
+        #         if sugg.get("ai_intent"):
+        #             st.session_state.ai_intent_override = sugg["ai_intent"]
+        #             st.rerun()
+        # with a3:
+        #     if st.button("Apply both"):
+        #         if sugg.get("keyword_query"):
+        #             st.session_state.query = sugg["keyword_query"]
+        #         if sugg.get("ai_intent"):
+        #             st.session_state.ai_intent_override = sugg["ai_intent"]
+        #         st.rerun()
+
+
+# -----------------------------
+# Top controls
+# -----------------------------
 top = st.container()
 with top:
     c1, c2, c3, c4 = st.columns([0.55, 0.15, 0.15, 0.15], vertical_alignment="bottom")
     with c1:
         st.text_input(
-            "Search query",
+            "Search query (keyword matching uses this)",
             key="query",
-            placeholder="Type keywords or a short phrase (used for both panels by default)",
+            placeholder="Type keywords or a short phrase",
         )
     with c2:
-        max_kw = st.slider("Keyword results", 5, 100, 20)
+        max_kw = st.slider("Keyword results", 5, 200, 30)
     with c3:
-        top_k_ai = st.slider("AI results", 5, 100, 20)
+        top_k_ai = st.slider("AI results", 5, 50, 20)
     with c4:
         use_same_query = st.checkbox("AI uses same query", value=True)
 
@@ -360,15 +572,15 @@ with left:
 # Right: AI search
 with right:
     st.markdown("### AI search (Gemini selects papers)")
-    q = (st.session_state.query or "").strip()
 
+    q = (st.session_state.query or "").strip()
     if use_same_query:
         ai_intent = q
-        #st.caption("AI intent is the same as the main query.")
+        st.caption("AI intent is the same as the main query.")
     else:
         ai_intent = st.text_input(
             "AI intent (optional override)",
-            value=q,
+            value=st.session_state.ai_intent_override or q,
             placeholder="Describe what you want (e.g., causal probing for interpretability)",
             key="ai_intent_override",
         )
@@ -387,33 +599,13 @@ with right:
     if run_ai:
         if not ai_intent.strip():
             st.warning("Please enter a query first.")
+        elif not HAS_GEMINI:
+            st.warning("Gemini is not configured (missing GEMINI_API_KEY). Add it in Streamlit Cloud secrets.")
         else:
-            library = [brief_for_ai(p) for p in papers]
-            prompt = f"""
-You are an AI retrieval tool over a local paper library.
-
-Return ONLY valid JSON with exactly this schema:
-{{
-  "paper_ids": ["... up to {top_k_ai} ids from the library ..."],
-  "note": "1-2 sentence rationale"
-}}
-
-User intent: {ai_intent}
-
-Library (JSON list):
-{json.dumps(library, ensure_ascii=False)}
-"""
             with st.spinner("Selecting papers…"):
-                resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-                parsed = parse_json_lenient(resp.text or "") or {}
-
-            ids = parsed.get("paper_ids", [])
-            if not isinstance(ids, list):
-                ids = []
-
-            ids = [pid for pid in ids if pid in papers_by_id]
+                ids, note = run_ai_retrieval(ai_intent, top_k_ai=top_k_ai, papers=papers, papers_by_id=papers_by_id)
             st.session_state.ai_selected_ids = ids
-            st.session_state.ai_note = str(parsed.get("note", "")).strip()
+            st.session_state.ai_note = note
             st.rerun()
 
     if st.session_state.ai_note:
